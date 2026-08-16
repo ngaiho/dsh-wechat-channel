@@ -22,7 +22,14 @@ export class Router {
             if (!channel.isConfigured())
                 continue;
             channel.onMessage(message => {
-                void this.routeMessage(channel, message);
+                // 可靠性增强：可选的拦截钩子（微信审批回复等）先于普通路由处理；
+                // 拦截器返回 true 表示消息已被消费，不再路由。
+                const handled = this.deps.intercept?.(channel, message)
+                if (handled?.then !== undefined) {
+                    void handled.then(h => { if (!h) void this.routeMessage(channel, message) })
+                } else if (!handled) {
+                    void this.routeMessage(channel, message)
+                }
             });
             await channel.connect();
         }

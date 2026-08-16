@@ -9,6 +9,7 @@ import { HarnessDriver } from "./driver.js";
 import { WechatChannel, loadWechatCredentials } from "../channels/wechat/index.js";
 import { FeishuChannel, loadFeishuCredentials } from "../channels/feishu/index.js";
 import { LoginApi } from "./login-api.js";
+import { installApprovalAnswerer, handleApprovalReply, wechatUserForSession, anyWechatUser, pendingApprovalCount } from "./wechat-ops.js";
 export const name = 'im-channel';
 export const inject = ['agents'];
 const NS = settingsNamespace('im-channel');
@@ -67,6 +68,47 @@ export function apply(ctx, config) {
     // One bind store for the whole plugin lifetime: the bound-session rows
     // must survive router rebuilds, and /bind hands out new sessions from it.
     const store = new BindStore();
+    // ---- 微信运维扩展：主动推送 + 审批应答 ----
+    /** 把文本发送给绑定微信用户（targetUserId 缺省时发给任一绑定用户）。 */
+    const sendToUser = async (text, targetUserId) => {
+        const ch = router?.channels.find(c => c.kind === 'wechat');
+        if (ch === undefined) return false;
+        const userId = targetUserId ?? anyWechatUser();
+        if (userId === undefined) return false;
+        await ch.send({ kind: 'wechat', targetId: userId }, { text });
+        return true;
+    };
+    // 审批应答器：approval/request 推送到微信，用户回复「同意/拒绝」即授权
+    installApprovalAnswerer(ctx, sendToUser);
+    // 工具：任意智能体可主动给微信发消息（如进度汇报）
+    ctx.inject(['tools'], (tctx) => {
+        tctx.tools.register({
+            name: 'wechat_send',
+            description: '发送消息到绑定的微信用户（进度汇报/通知）。',
+            parameters: {
+                type: 'object',
+                properties: {
+                    text: { type: 'string', description: '要发送的文本' },
+                },
+                required: ['text'],
+                additionalProperties: false,
+            },
+            output: {
+                schema: {
+                    type: 'object',
+                    properties: { sent: { type: 'boolean' } },
+                    required: ['sent'],
+                    additionalProperties: false,
+                },
+                render: (args, value) => [{ type: 'text', text: value.sent ? '✅ 已发送到微信' : '❌ 发送失败（未绑定或频道未激活）' }],
+            },
+            async execute(args) {
+                const userId = ctx.agent !== undefined ? wechatUserForSession(ctx.agent.id) : undefined;
+                const sent = await sendToUser(String(args.text ?? ''), userId);
+                return { sent };
+            },
+        });
+    });
     /**
      * Reconcile the live router against the declared instances: a changed
      * set, kind, or enabled flag restarts the router wholesale — channel
@@ -105,6 +147,7 @@ export function apply(ctx, config) {
             driver,
             store,
             config: { commandPrefix: next.commandPrefix },
+            intercept: (channel, message) => handleApprovalReply(message, sendToUser),
             status: () => {
                 const selection = ctx.get('agentDefaultModel');
                 if (selection !== undefined) {
@@ -189,6 +232,7 @@ export function apply(ctx, config) {
                     routerActive: router !== undefined,
                     channels: router?.channels.map(c => ({ kind: c.kind, configured: c.isConfigured() })) ?? [],
                     credentials: { wechat: loadWechatCredentials() !== undefined, feishu: loadFeishuCredentials() !== undefined },
+                    pendingApprovals: pendingApprovalCount(),
                 }));
             },
         });
@@ -206,6 +250,35 @@ export function apply(ctx, config) {
                     res.writeHead(500, { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }));
                 }
+            },
+        });
+        // 主动推送：外部脚本/监控可 POST {"text":"..."} 给绑定微信用户发消息
+        wctx.webServer.register({
+            kind: 'exact',
+            path: '/im-channel/send',
+            handler: (req, res) => {
+                let body = '';
+                req.on('data', (chunk) => { body += chunk; });
+                req.on('end', () => {
+                    let text = '';
+                    try { text = JSON.parse(body || '{}').text ?? ''; } catch { /* ignore */ }
+                    if (typeof text !== 'string' || text.length === 0) {
+                        res.writeHead(400, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ ok: false, error: 'missing text' }));
+                        return;
+                    }
+                    void sendToUser(text).then(sent => {
+                        res.writeHead(sent ? 200 : 503, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ ok: sent, sent }));
+                    }).catch(error => {
+                        res.writeHead(500, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }));
+                    });
+                });
+                req.on('error', () => {
+                    res.writeHead(500, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: false, error: 'request error' }));
+                });
             },
         });
     });
